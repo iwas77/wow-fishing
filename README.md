@@ -43,25 +43,45 @@ pywin32==305
 4. Extract RAR files
    - Extract `src\Data\Model_Weights\*.rar` files to generate `trained_weights_final.h5`
 
+5. Download TrainYourOwnYOLO
+   - From the project root directory, clone the repository:
+     ```bash
+     git clone https://github.com/iwas77/TrainYourOwnYOLO.git
+     ```
+   - This places the source in `TrainYourOwnYOLO` under the project root.
+
+6. Configure `src\wow_fishing_checker.py`
+   - Set `MODEL_PATH`, `ANCHORS_PATH`, and `CLASSES_PATH` to the corresponding files under `src\Data\Model_Weights`. With the program launched from the `src` directory, the existing relative paths are:
+     ```python
+     MODEL_PATH = './Data/Model_Weights/trained_weights_final.h5'
+     ANCHORS_PATH = './Data/Model_Weights/yolo_anchors.txt'
+     CLASSES_PATH = './Data/Model_Weights/data_classes.txt'
+     ```
+   - Update both `sys.path.append(...)` entries to the `keras_yolo3` directory in the downloaded source. Replace `<PROJECT_ROOT>` with the actual path to your project:
+     ```python
+     sys.path.append('<PROJECT_ROOT>\\TrainYourOwnYOLO\\2_Training\\src\\keras_yolo3')
+     sys.path.append('<PROJECT_ROOT>\\TrainYourOwnYOLO\\2_Training\\src\\keras_yolo3')
+     ```
+
 ### 3. Game Configuration
-5. Launch World of Warcraft
-6. Resize game client: Set to 1/4 of screen size
-7. Action bar setup: Place fishing cast button in slot '1'
-8. Game settings: Enable Auto Loot
-9. Adjust camera view: Position camera so the fishing bobber is clearly visible
+7. Launch World of Warcraft
+8. Resize game client: Set to 1/4 of screen size
+9. Action bar setup: Place fishing cast button in slot '1'
+10. Game settings: Enable Auto Loot
+11. Adjust camera view: Position camera so the fishing bobber is clearly visible
 
 ### 4. Run the Program
-10. Navigate to source directory
+12. Navigate to source directory
     ```bash
     cd src
     ```
 
-11. Run the program
+13. Run the program
     ```bash
     python wow_fishing_checker.py
     ```
 
-12. Adjust sub-window positions as needed
+14. Adjust sub-window positions as needed
 
 <img width="2784" height="1680" alt="Image" src="https://github.com/user-attachments/assets/43100f55-ba96-486f-9aec-9a282b076d7d" />
 
