@@ -1,369 +1,315 @@
-"""
-wow_detect.py
-world of warcraft auto fishing system
+"""World of Warcraft fishing bobber detector and controller."""
 
-author: jahyun koo (jhkoo77@gmail.com)
-date: 2026
-license: MIT License
-copyright: (c) 2026 jhkoo77@gmail.com
-"""
-
-
-
-# title of the wow window
-WOW_WINDOW_TITLE = "월드 오브 워크래프트"
-# delay time for pull force
-PULL_DELAY = 5
-# delay time for capture image
-CAPTURE_DELAY = .02
-
-# minimum number of distance ratios to check if something happened
-MININUM_DISTANCE_COUNT = 5
-
-# delay time for casting
-CASTING_DELAY = 1
-
-# casting slot number
-CASTING_SLOT_NUMBER = '1'
-
-# model path
-MODEL_PATH = './Data/Model_Weights/trained_weights_final.h5'
-# anchors path
-ANCHORS_PATH = './Data/Model_Weights/yolo_anchors.txt'
-# classes path
-CLASSES_PATH = './Data/Model_Weights/data_classes.txt'
-
-
-
-import sys
-
-sys.path.append('E:\\wowbot\\TrainYourOwnYOLO2\\2_Training\\src\\keras_yolo3')
-sys.path.append('E:\\wowbot\\TrainYourOwnYOLO2\\2_Training\\src\\keras_yolo3\\')
-
-
-from yolo import YOLO
-import pyautogui
-
-
-
-import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
+import sys
+import time
+
 import cv2
 import numpy as np
+import pyautogui
+import win32api
 import win32con
 import win32gui
 import win32ui
-import win32api
 from PIL import Image, ImageDraw
-import matplotlib.pyplot as plt
 
-from util import Point, Rect
-
-yolo_modelo = None
+from util import Rect
 
 
+# title of the WoW window
+WOW_WINDOW_TITLE = "월드 오브 워크래프트"
+PULL_DELAY = 5
+CAPTURE_DELAY = 0.02
+CASTING_DELAY = 1
+CASTING_SLOT_NUMBER = "1"
+MISSING_BOBBER_TIMEOUT = 3
+MINIMUM_DISTANCE_COUNT = 5
+DISTANCE_HISTORY_SIZE = 20
+DISTANCE_MULTIPLIER = 6
+MINIMUM_MOVEMENT_RATIO = 1.0
+REQUIRED_MOVEMENT_FRAMES = 2
+# IMPROVEMENT: Enable the live capture/detection preview by default for tuning.
+SHOW_DETECTION_STATUS = True
+
+# IMPROVEMENT: Resolve resources from this file rather than the launch directory.
+SOURCE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = SOURCE_DIR / "Data" / "Model_Weights" / "trained_weights_final.h5"
+ANCHORS_PATH = SOURCE_DIR / "Data" / "Model_Weights" / "yolo_anchors.txt"
+CLASSES_PATH = SOURCE_DIR / "Data" / "Model_Weights" / "data_classes.txt"
+
+# IMPROVEMENT: Use the checked-out YOLO source when it is present in the project.
+YOLO_SOURCE_DIR = SOURCE_DIR.parent / "TrainYourOwnYOLO-master" / "2_Training" / "src" / "keras_yolo3"
+if YOLO_SOURCE_DIR.is_dir():
+    sys.path.insert(0, str(YOLO_SOURCE_DIR))
+
+from yolo import YOLO
+
+
+yolo_model = None
+
+
+@dataclass
 class BobberInfo:
-    """
-    Information class for fishing bobber (낚시찌).
-    
-    Attributes:
-        at (datetime): Detection timestamp
-        box (Rect): Bounding box of the bobber
-    """
-    at = datetime.now();
-    box = Rect(0, 0, 0, 0);
+    """A single bobber observation."""
 
-    def __init__(self):
-        """Initialize bobber info with default values."""
-        pass
-
-    def init(self, box):
-        """
-        Initialize bobber info with detection box.
-        
-        Args:
-            box: Bounding box rectangle of the detected bobber
-        """
-        self.at = datetime.now()
-        self.box = box
+    # IMPROVEMENT: Instance fields avoid the shared mutable class defaults.
+    box: Rect
+    at: datetime = field(default_factory=datetime.now)
 
 
-def captureTargetWindow(title):
-    """
-    Capture the target window and return the image and window handle.
-    
-    Args:
-        title: Title of the target window
-        
-    Returns:
-        Image and window handle
-    """
-    hwnd = findTargetWindow(title);
-    if hwnd == None:
-        print(f'>> ERROR :: not found target window {title}')
-        exit(1)
+def find_target_window(title):
+    """Return the first visible window whose title contains ``title``."""
+    matches = []
 
-    left, top, right, bot = win32gui.GetWindowRect(hwnd)
-    w = right - left
-    h = bot - top
+    def callback(hwnd, hwnd_list):
+        if win32gui.IsWindowVisible(hwnd) and title in win32gui.GetWindowText(hwnd):
+            hwnd_list.append(hwnd)
+        return True
+
+    win32gui.EnumWindows(callback, matches)
+    return matches[0] if matches else None
 
 
-    hdesktop = win32gui.GetDesktopWindow()
-    hwndDC = win32gui.GetWindowDC(hdesktop)
-    mfcDC = win32ui.CreateDCFromHandle(hwndDC)
-    saveDC = mfcDC.CreateCompatibleDC()
+def capture_target_window(title):
+    """Capture a window and return its image, handle, and screen origin."""
+    hwnd = find_target_window(title)
+    if hwnd is None or not win32gui.IsWindow(hwnd):
+        raise RuntimeError(f"Target window was not found: {title}")
 
-    saveBitMap = win32ui.CreateBitmap()
-    saveBitMap.CreateCompatibleBitmap(mfcDC, w, h)
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    width, height = right - left, bottom - top
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Target window has an invalid size")
 
-    saveDC.SelectObject(saveBitMap)
+    desktop = win32gui.GetDesktopWindow()
+    desktop_dc = win32gui.GetWindowDC(desktop)
+    mfc_dc = save_dc = bitmap = None
+    try:
+        mfc_dc = win32ui.CreateDCFromHandle(desktop_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        bitmap = win32ui.CreateBitmap()
+        bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+        save_dc.SelectObject(bitmap)
+        # IMPROVEMENT: pywin32 BitBlt returns None on success; failures raise an exception.
+        # Checking its return value incorrectly treated every successful capture as a failure.
+        save_dc.BitBlt((0, 0), (width, height), mfc_dc, (left, top), win32con.SRCCOPY)
 
-    result = saveDC.BitBlt((0, 0), (w, h), mfcDC, (left, top), win32con.SRCCOPY)
+        info = bitmap.GetInfo()
+        pixels = bitmap.GetBitmapBits(True)
+        image = Image.frombuffer(
+            "RGB", (info["bmWidth"], info["bmHeight"]), pixels, "raw", "BGRX", 0, 1
+        )
+        # IMPROVEMENT: Preserve the capture origin for a reliable screen-coordinate conversion.
+        return image, hwnd, (left, top)
+    finally:
+        # IMPROVEMENT: Always release Windows GDI resources, including on capture failure.
+        if bitmap is not None:
+            win32gui.DeleteObject(bitmap.GetHandle())
+        if save_dc is not None:
+            save_dc.DeleteDC()
+        if mfc_dc is not None:
+            mfc_dc.DeleteDC()
+        win32gui.ReleaseDC(desktop, desktop_dc)
 
-    bmpinfo = saveBitMap.GetInfo()
-    bmpstr = saveBitMap.GetBitmapBits(True)
 
-    im = Image.frombuffer(
-        'RGB',
-        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-        bmpstr, 'raw', 'BGRX', 0, 1)
-
-    win32gui.DeleteObject(saveBitMap.GetHandle())
-    saveDC.DeleteDC()
-    mfcDC.DeleteDC()
-    win32gui.ReleaseDC(hdesktop, hwndDC)
-
-    return im, hwnd;
-
-
-def sendKey(hwnd, ch):
+def send_key(hwnd, key):
+    """Send a key press after validating the target window."""
+    if hwnd is None or not win32gui.IsWindow(hwnd):
+        raise RuntimeError("Target window is no longer available")
     win32gui.SetForegroundWindow(hwnd)
-    win32api.SendMessage(hwnd, win32con.WM_KEYDOWN, ord(ch), 0)
-    time.sleep(.1)
-    win32api.SendMessage(hwnd, win32con.WM_KEYUP, ord(ch), 0)
+    win32api.SendMessage(hwnd, win32con.WM_KEYDOWN, ord(key), 0)
+    time.sleep(0.1)
+    win32api.SendMessage(hwnd, win32con.WM_KEYUP, ord(key), 0)
 
 
 def init_yolo():
-    global yolo_modelo;
-    yolo_modelo = YOLO(model_path=MODEL_PATH,
-                       anchors_path=ANCHORS_PATH,
-                       classes_path=CLASSES_PATH)
+    """Load the model after validating the locally resolved weight file."""
+    global yolo_model
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(f"Model weights not found: {MODEL_PATH}")
+    yolo_model = YOLO(
+        model_path=str(MODEL_PATH), anchors_path=str(ANCHORS_PATH), classes_path=str(CLASSES_PATH)
+    )
 
 
-def detect_bobber(img):
-    """
-    Detect fishing bobber (낚시찌) in the image using YOLO model.
-    
-    Args:
-        img: Image to detect bobber in
-        
-    Returns:
-        Detection results or None if no bobber detected
-    """
-    detected_info = yolo_modelo.detect_image(img, show_stats=False)
-    dim = detected_info[0]
-    if len(dim) == 0:
-        return None;
-
-    return dim;
+def detect_bobber(image):
+    """Return raw YOLO detections, or ``None`` when no bobber is detected."""
+    if yolo_model is None:
+        raise RuntimeError("YOLO model has not been initialized")
+    detections = yolo_model.detect_image(image, show_stats=False)[0]
+    return detections if len(detections) else None
 
 
+def select_bobber_box(detections, previous_box=None):
+    """Pick the detection nearest to the previously tracked bobber."""
+    boxes = [Rect(*detection[:4]) for detection in detections if len(detection) >= 4]
+    if not boxes:
+        return None
+    if previous_box is None:
+        return boxes[0]
 
-def findTargetWindow(title):
-    """
-    Find the target window by title.
-    
-    Args:
-        title: Title of the target window
-        
-    Returns:
-        Window handle or None if not found
-    """
-    def callback(hwnd, hwnd_list: list):
-        """
-        Callback function to find the target window.
-        
-        Args:
-            hwnd: Window handle
-            hwnd_list: List of window handles
-        """
-        target_title = win32gui.GetWindowText(hwnd)
-        if target_title.find(title) != -1:
-            hwnd_list.append((title, hwnd))
-        return True;
-
-    # initialize window handle list
-    hwnd_list = []
-
-    # enumerate all windows and find the target window
-    win32gui.EnumWindows(callback, hwnd_list)
-    if len(hwnd_list) == 0:
-        return None;
-
-    # return the first window handle
-    hwnd = hwnd_list[0][1]
-    return hwnd;
+    # IMPROVEMENT: Do not switch bobbers when multi-object detections change order.
+    previous_center = previous_box.center()
+    return min(boxes, key=lambda box: previous_center.dist(box.center()))
 
 
-def pull_force(bobber_info, hwnd):
-    """
-    Pull the fishing line when bobber (낚시찌) movement is detected.
-    
-    Args:
-        bobber_info: BobberInfo object containing bobber position
-        hwnd: Window handle
-    """
-    print(bobber_info)
-    print(f'pull force------------------------')
-    
-    # get the window rectangle
-    w_rc = win32gui.GetWindowRect(hwnd)
-    # get the client point of the bobber
-    # subtract 32 pixels from the y coordinate to get the click point
-    pt_x, pt_y = win32gui.ClientToScreen(hwnd, (int(bobber_info.box.center().x), int(bobber_info.box.center().y) - 32))
-
-    print(f'window rc = {w_rc}, bobber center = {bobber_info.box.center()}, click point = {(pt_x, pt_y)}')
-
-    #pyautogui.click(x=pt_x, y=pt_y, button='right')
-    # move to the bobber and pull the fishing line
-    pyautogui.moveTo(pt_x, pt_y)
+def pull_force(bobber_info, capture_origin):
+    """Right-click the bobber using the coordinate system of the captured image."""
+    center = bobber_info.box.center()
+    # IMPROVEMENT: Avoid fragile title-bar constants by converting directly to screen coordinates.
+    point = (int(capture_origin[0] + center.x), int(capture_origin[1] + center.y))
+    print(f">> pulling at {point}")
+    pyautogui.moveTo(*point)
     pyautogui.rightClick()
     time.sleep(PULL_DELAY)
 
 
 def casting():
-    """
-    Cast the fishing line.
-    """
-    hwnd = findTargetWindow(WOW_WINDOW_TITLE)
-    # send the key to the window to cast the fishing line
-    sendKey(hwnd, CASTING_SLOT_NUMBER)
-    # wait for the casting to complete
+    """Cast a fishing line, returning False when the game window is unavailable."""
+    hwnd = find_target_window(WOW_WINDOW_TITLE)
+    if hwnd is None:
+        print(">> ERROR :: target window not found; will retry")
+        return False
+    send_key(hwnd, CASTING_SLOT_NUMBER)
     time.sleep(CASTING_DELAY)
+    return True
 
 
-def showDetectStatus(img, info):
-    draw = ImageDraw.Draw(img);
-    if info != None:
+def show_detect_status(image, info, status_lines=None):
+    """Display the debug frame only when explicitly enabled."""
+    if not SHOW_DETECTION_STATUS:
+        return
+    draw = ImageDraw.Draw(image)
+    if info is not None:
         draw.rectangle(info.box.list(), outline=(255, 128, 128))
-        draw.rectangle(Rect.from_point(info.box.center(), 2).list(), fill=(0, 255, 0),
-                       outline=(255, 0, 0))
-
-    numpy_image = np.array(img)
-    opencv_image = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
-    cv2.imshow("PIL2OpenCV", opencv_image)
+        draw.rectangle(Rect.from_point(info.box.center(), 2).list(), fill=(0, 255, 0))
+    # IMPROVEMENT: Overlay live detection and movement metrics on the preview frame.
+    if status_lines:
+        text = "\n".join(status_lines)
+        text_bounds = draw.multiline_textbbox((10, 10), text, spacing=2)
+        draw.rectangle(text_bounds, fill=(0, 0, 0))
+        draw.multiline_text((10, 10), text, fill=(255, 255, 0), spacing=2)
+    cv2.imshow("bobber detection", cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR))
     cv2.waitKeyEx(1)
 
 
-def is_something_happend(cur_dist_ratio, dists):
-    """
-    Check if something happened based on the current distance ratio and previous distance ratios.
-    
-    Args:
-        cur_dist_ratio: Current distance ratio
-        dists: List of previous distance ratios
-        
-    Returns:
-        True if something happened, False otherwise
-    """
-
-    # if the number of previous distance ratios is less than 5, return False
-    if len(dists) < MININUM_DISTANCE_COUNT:
+def is_something_happened(current_ratio, history):
+    """Return whether movement exceeds a robust, recent baseline."""
+    if len(history) < MINIMUM_DISTANCE_COUNT:
         return False
-
-    # calculate the average of the previous distance ratios
-    avrage = .0
-    
-    for dist in dists:
-        avrage = avrage + dist
-    avrage = avrage / (len(dists))
-
-    # if the current distance ratio is greater than the average of the previous distance ratios * 6, return True
-    print(f'>> check dist info = {cur_dist_ratio}, avr = {avrage}')
-
-    if cur_dist_ratio > (avrage * 6):
-        print(f'>> something happened !! dist = {cur_dist_ratio}, avr = {avrage}')
-        return True;
-
-    return False
+    baseline = float(np.median(history))
+    threshold = max(MINIMUM_MOVEMENT_RATIO, baseline * DISTANCE_MULTIPLIER)
+    print(f">> check dist info = {current_ratio:.3f}, baseline = {baseline:.3f}")
+    return current_ratio > threshold
 
 
 def run_fishing_cycle():
-    capture_img, hwnd = captureTargetWindow(WOW_WINDOW_TITLE)
-    detected_result = detect_bobber(capture_img.copy());
+    """Track one cast until its bobber disappears or is pulled."""
+    try:
+        image, _, _ = capture_target_window(WOW_WINDOW_TITLE)
+    except RuntimeError as error:
+        print(f">> ERROR :: {error}")
+        return
 
-    if detected_result is None:
-        print(f'>> ERROR :: bobber not detect !! casting...........')
-        casting();
+    initial_detections = detect_bobber(image.copy())
+    if initial_detections is None:
+        show_detect_status(image, None, ["Detection: none", "Action: casting"])
+        print(">> bobber not detected; casting")
+        casting()
+        return
 
-    # initialize previous bobber information
-    prev_bobber_info = BobberInfo();
+    initial_box = select_bobber_box(initial_detections)
+    if initial_box is None:
+        show_detect_status(image, None, ["Detection: invalid", "Action: casting"])
+        print(">> invalid bobber detection; casting")
+        casting()
+        return
 
-    # initialize distance log
-    dist_log = []
+    # IMPROVEMENT: Retain the initial detection so a following missing frame has a timeout baseline.
+    previous_info = BobberInfo(initial_box)
+    last_seen_at = previous_info.at
+    # IMPROVEMENT: Show the first captured frame, including its selected bobber box.
+    show_detect_status(image, previous_info, ["Detection: found", "Distance: -- (initial frame)"])
+    distance_history = deque(maxlen=DISTANCE_HISTORY_SIZE)
+    movement_frames = 0
+
     while True:
-
         time.sleep(CAPTURE_DELAY)
+        try:
+            image, _, capture_origin = capture_target_window(WOW_WINDOW_TITLE)
+        except RuntimeError as error:
+            print(f">> ERROR :: {error}")
+            return
 
-        # initialize current bobber information
-        cur_bobber_info = BobberInfo()
-
-        capture_img, hwnd = captureTargetWindow(WOW_WINDOW_TITLE)
-        detected_result = detect_bobber(capture_img.copy());
-
-        if detected_result is None:
-
-            showDetectStatus(capture_img, None)
-            last_found_bobber_before = (datetime.now() - prev_bobber_info.at).total_seconds()
-            if last_found_bobber_before >= 3:
-                break
+        detections = detect_bobber(image.copy())
+        if detections is None:
+            show_detect_status(image, None, ["Detection: none", "Distance: --"])
+            # IMPROVEMENT: Start the disappearance timeout only after a real prior observation.
+            if last_seen_at and (datetime.now() - last_seen_at).total_seconds() >= MISSING_BOBBER_TIMEOUT:
+                return
             continue
 
-        cur_box = Rect(detected_result[0][0], detected_result[0][1], detected_result[0][2], detected_result[0][3])
-        cur_bobber_info.init(cur_box)
-        
-        # calculate distance ratio
-        showDetectStatus(capture_img, cur_bobber_info);
-        
-        prev_box = prev_bobber_info.box
-        cur_box = cur_bobber_info.box
+        box = select_bobber_box(detections, previous_info.box if previous_info else None)
+        if box is None:
+            continue
+        current_info = BobberInfo(box)
+        last_seen_at = current_info.at
 
-        union_box = prev_box.union(cur_box)
-        dist_pt = prev_box.center().dist(cur_box.center())
+        if previous_info is None:
+            # IMPROVEMENT: The first valid frame initializes the tracker; it is not movement.
+            show_detect_status(image, current_info, ["Detection: found", "Distance: -- (initial frame)"])
+            previous_info = current_info
+            continue
 
-        hor_dist_ratio = dist_pt / union_box.width() * 100.0
-        ver_dist_ratio = dist_pt / union_box.height() * 100.0
+        union_box = previous_info.box.union(current_info.box)
+        if union_box.height() <= 0:
+            show_detect_status(image, current_info, ["Detection: found", "Distance: invalid box height"])
+            previous_info = current_info
+            continue
+        distance = previous_info.box.center().dist(current_info.box.center())
+        distance_ratio = distance / union_box.height() * 100.0
 
-        #vertical distance ratio is more important than horizontal distance ratio
-        dist_ratio = ver_dist_ratio #(hor_dist_ratio ** 2 + ver_dist_ratio **2) ** .5;
+        movement_detected = is_something_happened(distance_ratio, distance_history)
+        baseline = float(np.median(distance_history)) if distance_history else None
+        threshold = (
+            max(MINIMUM_MOVEMENT_RATIO, baseline * DISTANCE_MULTIPLIER)
+            if baseline is not None and len(distance_history) >= MINIMUM_DISTANCE_COUNT
+            else None
+        )
+        preview_lines = [
+            "Detection: found",
+            f"Distance: {distance_ratio:.3f}%",
+            f"Baseline: {baseline:.3f}%" if baseline is not None else "Baseline: collecting samples",
+            f"Threshold: {threshold:.3f}%" if threshold is not None else "Threshold: collecting samples",
+            f"Samples: {len(distance_history)}/{MINIMUM_DISTANCE_COUNT}",
+            f"Movement frames: {movement_frames}/{REQUIRED_MOVEMENT_FRAMES}",
+        ]
+        # IMPROVEMENT: Draw the metrics after calculating this frame's distance.
+        show_detect_status(image, current_info, preview_lines)
 
+        if movement_detected:
+            movement_frames += 1
+            if movement_frames >= REQUIRED_MOVEMENT_FRAMES:
+                pull_force(current_info, capture_origin)
+                return
+        else:
+            movement_frames = 0
+            # IMPROVEMENT: Keep a bounded baseline of normal motion only.
+            distance_history.append(distance_ratio)
 
-        if is_something_happend(dist_ratio, dist_log) is True:
-            time.sleep(.5)
-            pull_force(cur_bobber_info, hwnd)
-            break;
-
-        dist_log.append(dist_ratio)
-        prev_bobber_info = cur_bobber_info;
-
-
-def test():
-    hwnd = findTargetWindow(WOW_WINDOW_TITLE)
-    wrc = win32gui.GetWindowRect(hwnd)
-    print(wrc)
-    client_pt = win32gui.ClientToScreen(hwnd, (10, 10))
-    print(client_pt)
-    exit(1)
+        previous_info = current_info
 
 
 def start():
-    init_yolo();
-
+    """Initialize dependencies and repeatedly run fishing cycles."""
+    init_yolo()
     while True:
-        run_fishing_cycle();
+        run_fishing_cycle()
         time.sleep(1)
 
 
-
 if __name__ == "__main__":
-    start();
+    start()
