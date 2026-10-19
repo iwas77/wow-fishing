@@ -1,10 +1,9 @@
-#Python 3.7.16
-tensorflow==2.3
-keras==2.4
-Pillow==9.3.0
-matplotlib==3.5.3
+# Requires CPython 3.12.x on Windows (Python 3.14 is not supported by this lock-free set).
+# Install from https://www.python.org/downloads/release/python-3120/ before running pip.
+ultralytics>=8.3.0
+Pillow>=10.4.0,<12
 PyAutoGUI==0.9.53
 PyGetWindow==0.0.9
 PyMsgBox==1.0.9
-opencv-python==4.6.0.66
-pywin32==305
+opencv-python>=4.10.0.84
+pywin32>=306

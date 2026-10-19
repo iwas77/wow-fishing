@@ -1,5 +1,10 @@
-src/Data/Model_Weights/trained_weights_final.h5
-src/__pycache__
-src/keras_yolo3/__pycache__
-TrainYourOwnYOLO-master
-/TrainYourOwnYOLO-master
+# Python environment and cache files
+__pycache__/
+*.py[cod]
+.venv/
+
+# Generated YOLO11 training dataset, logs, and checkpoints
+data/bobber/yolo11/
+runs/
+models/bobber/
+/yolo11*.pt
